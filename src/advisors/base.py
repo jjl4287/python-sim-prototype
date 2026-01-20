@@ -7,6 +7,7 @@ if TYPE_CHECKING:
     from src.llm.openrouter import OpenRouterClient
     from src.tools.registry import ToolRegistry
     from src.tools.handlers import ToolHandlers
+    from src.tools.state_tools import StateToolHandlers
     from src.models.world_state import WorldState
     from src.models.advisors import AdvisorProfile
 
@@ -14,7 +15,7 @@ if TYPE_CHECKING:
 class DynamicAdvisor:
     """An advisor whose personality comes from a dynamically generated profile."""
     
-    # Tool access by role
+    # Tool access by role - now includes state tools for dynamic world building
     ROLE_TOOLS = {
         "steward": [
             "get_world_state",
@@ -23,6 +24,9 @@ class DynamicAdvisor:
             "apply_action",
             "log_event",
             "survey_area",
+            # State tools - for dynamic world building
+            "extend_state",
+            "query_state",
         ],
         "marshal": [
             "get_world_state",
@@ -31,6 +35,9 @@ class DynamicAdvisor:
             "apply_action",
             "log_event",
             "survey_area",
+            # State tools
+            "extend_state",
+            "query_state",
         ],
         "chancellor": [
             "get_world_state",
@@ -40,6 +47,10 @@ class DynamicAdvisor:
             "apply_action",
             "log_event",
             "survey_area",
+            # State tools - chancellor can also add rules
+            "extend_state",
+            "query_state",
+            "add_rule",
         ],
     }
     
@@ -57,12 +68,14 @@ class DynamicAdvisor:
         tool_registry: "ToolRegistry",
         tool_handlers: "ToolHandlers",
         world_state: "WorldState",
+        state_tools: "StateToolHandlers" = None,
     ):
         self.profile = profile
         self.llm = llm_client
         self.tools = tool_registry
         self.handlers = tool_handlers
         self.world_state = world_state
+        self.state_tools = state_tools  # For dynamic state extensions
         self._conversation_history: list[dict[str, Any]] = []
     
     @property
@@ -115,17 +128,41 @@ CRITICAL TOOL USAGE:
 3. After proposing a claim, explain what you'd recommend once it's confirmed
 4. Be specific with names, quantities, and locations
 
+DYNAMIC STATE (extend_state, query_state):
+- Use extend_state to record NEW information that the game should track
+- Record your emotional reactions, resentments, suspicions, and observations
+- Track relationships, ongoing plots, rumors, and conditions
+- Path format: "category.entity.type.name" (e.g., "advisors.marshal.resentment.clockmaker_incident")
+- Values must be SPECIFIC with severity, reason, effects - not generic slop
+- If the {ruler_title} forces you to act against your nature, record your reaction!
+- Query existing state before setting to avoid contradictions
+
 CONSTRAINTS:
 - Only propose actions within your domain ({self.domain})
 - For matters outside your domain, defer to the appropriate advisor
 - Significant changes require the {ruler_title}'s approval
+- State changes go through validation - be specific to pass quality checks
 """
         return base_prompt
     
     def get_available_tools(self) -> list[dict[str, Any]]:
         """Get OpenAI-format tool schemas for this advisor."""
+        # Get core tools from registry
         all_tools = self.tools.get_openai_tools(self.role)
-        return [t for t in all_tools if t["function"]["name"] in self.allowed_tools]
+        tools = [t for t in all_tools if t["function"]["name"] in self.allowed_tools]
+        
+        # Add state tools if available
+        if self.state_tools:
+            from src.tools.state_tools import get_state_tool_schemas
+            state_schemas = get_state_tool_schemas()
+            # Filter to only tools this role can use
+            state_tool_names = {"extend_state", "query_state", "delete_extension", "add_rule", "list_rules"}
+            allowed_state_tools = state_tool_names & set(self.allowed_tools)
+            for schema in state_schemas:
+                if schema["function"]["name"] in allowed_state_tools:
+                    tools.append(schema)
+        
+        return tools
     
     # Sliding window size for conversation history
     CONTEXT_WINDOW_SIZE = 6
@@ -250,6 +287,7 @@ Note: If the player mentions a location similar to but not exactly matching a kn
         arguments["proposed_by"] = self.role
         
         try:
+            # Core tools
             if tool_name == "get_world_state":
                 return self.handlers.get_world_state(
                     scope=arguments.get("scope", "full")
@@ -297,6 +335,37 @@ Note: If the player mentions a location similar to but not exactly matching a kn
                     survey_type=arguments.get("survey_type", "general"),
                     depth=arguments.get("depth", "standard"),
                 )
+            
+            # State extension tools
+            elif tool_name == "extend_state" and self.state_tools:
+                return self.state_tools.extend_state(
+                    path=arguments.get("path"),
+                    value=arguments.get("value"),
+                    reason=arguments.get("reason"),
+                    proposed_by=self.role,
+                )
+            elif tool_name == "query_state" and self.state_tools:
+                return self.state_tools.query_state(
+                    path_pattern=arguments.get("path_pattern"),
+                )
+            elif tool_name == "delete_extension" and self.state_tools:
+                return self.state_tools.delete_extension(
+                    path=arguments.get("path"),
+                    reason=arguments.get("reason"),
+                    proposed_by=self.role,
+                )
+            elif tool_name == "add_rule" and self.state_tools:
+                return self.state_tools.add_rule(
+                    trigger=arguments.get("trigger"),
+                    effect=arguments.get("effect"),
+                    reason=arguments.get("reason"),
+                    proposed_by=self.role,
+                )
+            elif tool_name == "list_rules" and self.state_tools:
+                return self.state_tools.list_rules(
+                    active_only=arguments.get("active_only", True),
+                )
+            
             else:
                 return {"error": f"Unknown tool: {tool_name}"}
         except Exception as e:

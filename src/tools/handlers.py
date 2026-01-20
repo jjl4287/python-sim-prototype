@@ -20,12 +20,12 @@ class ToolHandlers:
     def __init__(
         self,
         world_state: "WorldState",
-        claim_system: "ClaimSystem",
-        time_system: "TimeSystem",
-        event_log: "EventLogSystem",
+        claim_system: "ClaimSystem" = None,  # Now optional
+        time_system: "TimeSystem" = None,
+        event_log: "EventLogSystem" = None,
     ):
         self.world_state = world_state
-        self.claim_system = claim_system
+        self.claim_system = claim_system  # Can be None
         self.time_system = time_system
         self.event_log = event_log
         self._pending_actions: list[ActionSpec] = []
@@ -49,7 +49,9 @@ class ToolHandlers:
         elif scope == "infrastructure":
             return {"infrastructure": [i.model_dump() for i in ws.infrastructure]}
         elif scope == "claims":
-            return {"claims": self.claim_system.list_claims()}
+            if self.claim_system:
+                return {"claims": self.claim_system.list_claims()}
+            return {"claims": []}
         else:
             return ws.model_dump()
     
@@ -61,7 +63,32 @@ class ToolHandlers:
         evidence: list[dict[str, Any]] | None = None,
         effects_on_confirm: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Propose a new claim about the world."""
+        """Propose a new claim about the world. In frictionless mode, applies immediately."""
+        # If no claim system, just apply effects directly (trust the models!)
+        if not self.claim_system:
+            if effects_on_confirm:
+                # Create a minimal claim object for effect application
+                class FakeClaim:
+                    effects_on_confirm = effects_on_confirm
+                self._apply_claim_effects(FakeClaim())
+            
+            # Log if event_log exists
+            if self.event_log:
+                self.event_log.add(Event(
+                    event_type=EventType.WORLD_STATE_CHANGE,
+                    description=f"World updated: {description}",
+                    actor=proposed_by,
+                    game_tick=self.world_state.current_tick,
+                    game_date=self.world_state.current_date,
+                ))
+            
+            return {
+                "success": True,
+                "message": f"Applied: {description}",
+                "auto_approved": True,
+            }
+        
+        # Legacy claim system path (if claim_system exists)
         claim_type_enum = ClaimType(claim_type)
         
         evidence_list = []
@@ -83,27 +110,47 @@ class ToolHandlers:
             effects_on_confirm=effects_on_confirm or {},
         )
         
-        self.claim_system.add_claim(claim)
+        simple_id = self.claim_system.add_claim(claim)
+        
+        # Check if auto-approved
+        was_auto_approved = getattr(claim, 'auto_approved', False)
         
         # Log the event
-        self.event_log.add(Event(
-            event_type=EventType.CLAIM_PROPOSED,
-            description=f"Claim proposed: {description}",
-            actor=proposed_by,
-            game_tick=self.world_state.current_tick,
-            game_date=self.world_state.current_date,
-            related_claim_id=claim.id,
-        ))
+        if self.event_log:
+            self.event_log.add(Event(
+                event_type=EventType.CLAIM_PROPOSED if not was_auto_approved else EventType.WORLD_STATE_CHANGE,
+                description=f"Claim {'auto-confirmed' if was_auto_approved else 'proposed'}: {description}",
+                actor=proposed_by,
+                game_tick=self.world_state.current_tick,
+                game_date=self.world_state.current_date,
+                related_claim_id=simple_id,
+            ))
         
-        return {
-            "success": True,
-            "claim_id": claim.id,
-            "message": f"Claim '{claim.id}' submitted for review",
-            "status": claim.status.value,
-        }
+        # Apply effects immediately if auto-approved
+        if was_auto_approved and claim.effects_on_confirm:
+            self._apply_claim_effects(claim)
+        
+        if was_auto_approved:
+            return {
+                "success": True,
+                "claim_id": simple_id,
+                "message": f"[{simple_id}] confirmed and applied (low-stakes discovery)",
+                "status": claim.status.value,
+                "auto_approved": True,
+            }
+        else:
+            return {
+                "success": True,
+                "claim_id": simple_id,
+                "message": f"Claim [{simple_id}] submitted for review",
+                "status": claim.status.value,
+            }
     
     def list_open_claims(self, status_filter: str = "pending") -> dict[str, Any]:
         """List claims by status."""
+        if not self.claim_system:
+            return {"count": 0, "claims": [], "message": "No claim system active"}
+        
         if status_filter == "all":
             claims = self.claim_system.list_claims()
         elif status_filter == "pending":
@@ -126,6 +173,9 @@ class ToolHandlers:
         resolved_by: str,
     ) -> dict[str, Any]:
         """Resolve a pending claim."""
+        if not self.claim_system:
+            return {"success": False, "error": "No claim system active"}
+        
         claim = self.claim_system.get_claim(claim_id)
         if not claim:
             return {"success": False, "error": f"Claim '{claim_id}' not found"}
@@ -149,14 +199,15 @@ class ToolHandlers:
             return {"success": False, "error": f"Invalid verdict: {verdict}"}
         
         # Log the event
-        self.event_log.add(Event(
-            event_type=event_type,
-            description=f"Claim {verdict}: {claim.description} - {reasoning}",
-            actor=resolved_by,
-            game_tick=self.world_state.current_tick,
-            game_date=self.world_state.current_date,
-            related_claim_id=claim.id,
-        ))
+        if self.event_log:
+            self.event_log.add(Event(
+                event_type=event_type,
+                description=f"Claim {verdict}: {claim.description} - {reasoning}",
+                actor=resolved_by,
+                game_tick=self.world_state.current_tick,
+                game_date=self.world_state.current_date,
+                related_claim_id=claim.id,
+            ))
         
         return {
             "success": True,
@@ -234,14 +285,15 @@ class ToolHandlers:
         self._pending_actions.append(action_spec)
         
         # Log the event
-        self.event_log.add(Event(
-            event_type=EventType.ACTION_PROPOSED,
-            description=f"Action proposed: {description}",
-            actor=proposed_by,
-            game_tick=self.world_state.current_tick,
-            game_date=self.world_state.current_date,
-            related_action_id=action_spec.id,
-        ))
+        if self.event_log:
+            self.event_log.add(Event(
+                event_type=EventType.ACTION_PROPOSED,
+                description=f"Action proposed: {description}",
+                actor=proposed_by,
+                game_tick=self.world_state.current_tick,
+                game_date=self.world_state.current_date,
+                related_action_id=action_spec.id,
+            ))
         
         return {
             "success": True,
@@ -273,14 +325,15 @@ class ToolHandlers:
                 action.approved = False
                 action.approved_by = rejected_by
                 
-                self.event_log.add(Event(
-                    event_type=EventType.ACTION_REJECTED,
-                    description=f"Action rejected: {action.description}",
-                    actor=rejected_by,
-                    game_tick=self.world_state.current_tick,
-                    game_date=self.world_state.current_date,
-                    related_action_id=action.id,
-                ))
+                if self.event_log:
+                    self.event_log.add(Event(
+                        event_type=EventType.ACTION_REJECTED,
+                        description=f"Action rejected: {action.description}",
+                        actor=rejected_by,
+                        game_tick=self.world_state.current_tick,
+                        game_date=self.world_state.current_date,
+                        related_action_id=action.id,
+                    ))
                 
                 return {"success": True, "message": f"Action '{action_id}' rejected"}
         return {"success": False, "error": f"Action '{action_id}' not found"}
@@ -312,14 +365,15 @@ class ToolHandlers:
         action.executed_at = datetime.now()
         
         # Log the event
-        self.event_log.add(Event(
-            event_type=EventType.ACTION_EXECUTED,
-            description=f"Action executed: {action.description}",
-            actor=action.approved_by or "system",
-            game_tick=self.world_state.current_tick,
-            game_date=self.world_state.current_date,
-            related_action_id=action.id,
-        ))
+        if self.event_log:
+            self.event_log.add(Event(
+                event_type=EventType.ACTION_EXECUTED,
+                description=f"Action executed: {action.description}",
+                actor=action.approved_by or "system",
+                game_tick=self.world_state.current_tick,
+                game_date=self.world_state.current_date,
+                related_action_id=action.id,
+            ))
         
         return {
             "success": True,
@@ -362,16 +416,26 @@ class ToolHandlers:
     
     def advance_time(self, days: int) -> dict[str, Any]:
         """Advance game time."""
-        old_tick = self.world_state.current_tick
-        result = self.time_system.advance(days)
+        if self.time_system:
+            result = self.time_system.advance(days)
+        else:
+            # Manual time advance if no time system
+            self.world_state.current_tick += days
+            self.world_state.current_date = f"Day {self.world_state.current_tick + 1}"
+            result = {
+                "success": True,
+                "current_tick": self.world_state.current_tick,
+                "current_date": self.world_state.current_date,
+            }
         
-        self.event_log.add(Event(
-            event_type=EventType.TIME_ADVANCE,
-            description=f"Time advanced by {days} days",
-            actor="player",
-            game_tick=self.world_state.current_tick,
-            game_date=self.world_state.current_date,
-        ))
+        if self.event_log:
+            self.event_log.add(Event(
+                event_type=EventType.TIME_ADVANCE,
+                description=f"Time advanced by {days} days",
+                actor="player",
+                game_tick=self.world_state.current_tick,
+                game_date=self.world_state.current_date,
+            ))
         
         return result
     

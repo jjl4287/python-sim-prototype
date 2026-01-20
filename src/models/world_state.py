@@ -3,7 +3,7 @@
 from __future__ import annotations
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Optional, Any
 from pydantic import BaseModel, Field
 import uuid
 
@@ -152,6 +152,19 @@ class AdvisorContext(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class DynamicRule(BaseModel):
+    """A dynamic game rule created by the AI during play."""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
+    trigger: str = Field(description="When this rule activates (natural language condition)")
+    effect: str = Field(description="What happens when triggered (natural language effect)")
+    reason: str = Field(description="Why this rule exists")
+    created_by: str = Field(default="system")
+    created_at: datetime = Field(default_factory=datetime.now)
+    active: bool = True
+    
+    model_config = {"extra": "allow"}
+
+
 class WorldState(BaseModel):
     """The complete canonical state of the game world."""
     # Metadata
@@ -165,7 +178,10 @@ class WorldState(BaseModel):
     current_tick: int = Field(default=0, description="Current game tick (days elapsed)")
     current_date: str = Field(default="Day 1", description="Display date")
     
-    # Core state
+    # Starting tensions (for display/reference)
+    starting_tensions: list[str] = Field(default_factory=list)
+    
+    # Core state (structured, typed)
     settlements: list[Settlement] = Field(default_factory=list)
     terrain: list[Terrain] = Field(default_factory=list)
     resources: Resources = Field(default_factory=Resources)
@@ -177,8 +193,151 @@ class WorldState(BaseModel):
     # Advisor context
     advisor_context: AdvisorContext = Field(default_factory=AdvisorContext)
     
+    # Dynamic extensions (AI-writable, freeform)
+    extensions: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Arbitrary nested data created by AI during play"
+    )
+    
+    # Dynamic rules (AI-created game mechanics)
+    dynamic_rules: list[DynamicRule] = Field(default_factory=list)
+    
     # Allow scenario-specific extensions
     model_config = {"extra": "allow"}
+    
+    def get_settlement(self, id_or_name: str) -> Optional[Settlement]:
+        """Find a settlement by ID or name."""
+        for s in self.settlements:
+            if s.id == id_or_name or s.name.lower() == id_or_name.lower():
+                return s
+        return None
+    
+    def get_terrain(self, id_or_name: str) -> Optional[Terrain]:
+        """Find terrain by ID or name."""
+        for t in self.terrain:
+            if t.id == id_or_name or t.name.lower() == id_or_name.lower():
+                return t
+        return None
+    
+    def get_faction(self, id_or_name: str) -> Optional[Faction]:
+        """Find a faction by ID or name."""
+        for f in self.factions:
+            if f.id == id_or_name or f.name.lower() == id_or_name.lower():
+                return f
+        return None
+    
+    # ===== Extension Path Methods =====
+    
+    def get_extension(self, path: str, default: Any = None) -> Any:
+        """Get a value from extensions using dot-notation path.
+        
+        Example: get_extension("advisors.marshal.resentment.clockmaker_incident")
+        """
+        keys = path.split(".")
+        current = self.extensions
+        
+        for key in keys:
+            if isinstance(current, dict) and key in current:
+                current = current[key]
+            else:
+                return default
+        
+        return current
+    
+    def set_extension(self, path: str, value: Any, metadata: Optional[dict] = None) -> bool:
+        """Set a value in extensions using dot-notation path.
+        
+        Example: set_extension("advisors.marshal.resentment.incident", {"severity": "high"})
+        
+        If metadata is provided, it's merged with the value if value is a dict.
+        """
+        keys = path.split(".")
+        current = self.extensions
+        
+        # Navigate/create path to parent
+        for key in keys[:-1]:
+            if key not in current:
+                current[key] = {}
+            elif not isinstance(current[key], dict):
+                # Can't traverse through non-dict
+                return False
+            current = current[key]
+        
+        # Set the final value
+        final_key = keys[-1]
+        
+        if isinstance(value, dict) and metadata:
+            value = {**value, "_meta": metadata}
+        elif metadata:
+            value = {"_value": value, "_meta": metadata}
+        
+        current[final_key] = value
+        return True
+    
+    def delete_extension(self, path: str) -> bool:
+        """Delete a value from extensions using dot-notation path."""
+        keys = path.split(".")
+        current = self.extensions
+        
+        # Navigate to parent
+        for key in keys[:-1]:
+            if isinstance(current, dict) and key in current:
+                current = current[key]
+            else:
+                return False
+        
+        # Delete the final key
+        final_key = keys[-1]
+        if isinstance(current, dict) and final_key in current:
+            del current[final_key]
+            return True
+        return False
+    
+    def list_extensions(self, prefix: str = "") -> list[str]:
+        """List all extension paths, optionally filtered by prefix."""
+        paths = []
+        
+        def _collect_paths(obj: dict, current_path: str):
+            for key, value in obj.items():
+                full_path = f"{current_path}.{key}" if current_path else key
+                if isinstance(value, dict) and not key.startswith("_"):
+                    # Check if this is a leaf node with metadata or a branch
+                    if "_value" in value or "_meta" in value:
+                        paths.append(full_path)
+                    else:
+                        _collect_paths(value, full_path)
+                else:
+                    paths.append(full_path)
+        
+        _collect_paths(self.extensions, "")
+        
+        if prefix:
+            paths = [p for p in paths if p.startswith(prefix)]
+        
+        return sorted(paths)
+    
+    def has_extension(self, path: str) -> bool:
+        """Check if an extension path exists."""
+        return self.get_extension(path) is not None
+    
+    # ===== Dynamic Rules =====
+    
+    def add_rule(self, trigger: str, effect: str, reason: str, created_by: str = "system") -> DynamicRule:
+        """Add a new dynamic rule."""
+        rule = DynamicRule(
+            trigger=trigger,
+            effect=effect,
+            reason=reason,
+            created_by=created_by,
+        )
+        self.dynamic_rules.append(rule)
+        return rule
+    
+    def get_active_rules(self) -> list[DynamicRule]:
+        """Get all active dynamic rules."""
+        return [r for r in self.dynamic_rules if r.active]
+    
+    # ===== Core Entity Lookups =====
     
     def get_settlement(self, id_or_name: str) -> Optional[Settlement]:
         """Find a settlement by ID or name."""
@@ -232,5 +391,30 @@ class WorldState(BaseModel):
             lines.append("--- Populations ---")
             for p in self.populations:
                 lines.append(f"  {p.social_class.value}: {p.count} (approval: {p.approval}%)")
+        
+        # Show extensions summary if any exist
+        ext_paths = self.list_extensions()
+        if ext_paths:
+            lines.append("")
+            lines.append("--- Dynamic State ---")
+            for path in ext_paths[:10]:  # Limit to 10
+                value = self.get_extension(path)
+                if isinstance(value, dict):
+                    summary = value.get("summary", value.get("reason", str(value)[:40]))
+                else:
+                    summary = str(value)[:40]
+                lines.append(f"  {path}: {summary}")
+            if len(ext_paths) > 10:
+                lines.append(f"  ... and {len(ext_paths) - 10} more")
+        
+        # Show active rules if any
+        active_rules = self.get_active_rules()
+        if active_rules:
+            lines.append("")
+            lines.append("--- Active Rules ---")
+            for rule in active_rules[:5]:
+                lines.append(f"  • {rule.trigger} → {rule.effect}")
+            if len(active_rules) > 5:
+                lines.append(f"  ... and {len(active_rules) - 5} more")
         
         return "\n".join(lines)

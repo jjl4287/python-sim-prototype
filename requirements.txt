@@ -5,3 +5,4 @@ python-dotenv>=1.0
 rich>=13.0
 prompt_toolkit>=3.0
 thefuzz>=0.22
+textual>=0.50textual>=0.50
